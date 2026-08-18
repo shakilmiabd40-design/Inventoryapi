@@ -1,2 +1,197 @@
-# Inventoryapi
-Inventory with api
+[README.md](https://github.com/user-attachments/files/31164335/README.md)
+# Stockroom — Inventory Management
+
+A self-hosted inventory system for a small team: track products, stock levels,
+and categories, log every restock/sale/adjustment, and expose a read-only API
+your website can pull live product and stock data from.
+
+- **Backend**: Node.js + Express + SQLite (via `better-sqlite3`) — one file
+  database, no external services required.
+- **Frontend**: React (Vite) admin dashboard for your team.
+- **Public API**: a read-only slice of the same backend, meant to be called
+  from your website.
+
+```
+inventory-system/
+├── backend/     Express API + SQLite database
+└── frontend/    React admin dashboard (for your team)
+```
+
+---
+
+## 1. Run it locally
+
+### Backend
+
+```bash
+cd backend
+npm install
+cp .env.example .env      # edit JWT_SECRET before going to production
+npm run seed               # creates an admin login + a couple of sample products
+npm run dev                 # starts the API on http://localhost:4000
+```
+
+Default login after seeding: `admin@example.com` / `admin123` — **change this
+password (or delete/recreate the user) before you rely on this for real
+data.**
+
+### Frontend
+
+In a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev                 # starts the dashboard on http://localhost:5173
+```
+
+Open http://localhost:5173 and sign in. From there your team can add
+products, categories, and record stock movements.
+
+---
+
+## 2. Push it to GitHub
+
+```bash
+cd inventory-system
+git init
+git add .
+git commit -m "Initial commit"
+gh repo create your-username/inventory-system --private --source=. --push
+```
+
+(No `gh` CLI? Create an empty repo on github.com, then `git remote add origin
+<url>` and `git push -u origin main`.)
+
+Both `.env` files and the SQLite database are already git-ignored — you'll
+create fresh ones on whatever server you deploy to.
+
+---
+
+## 3. Deploy it somewhere it can stay running
+
+The backend needs a host that runs a persistent Node process (not a
+serverless/static host), since SQLite is a local file. Good low-effort
+options:
+
+- **Render** or **Railway** — connect the GitHub repo, point it at
+  `backend/`, set the environment variables from `.env.example`, and it'll
+  build and run automatically. Attach a small persistent disk so the SQLite
+  file survives restarts/deploys.
+- **A VPS** (DigitalOcean, Hetzner, etc.) — clone the repo, `npm install`,
+  run with `pm2` or a systemd service.
+
+The frontend is a static build (`npm run build` → `frontend/dist`) — deploy
+it anywhere that serves static files (Vercel, Netlify, Cloudflare Pages, or
+just a folder on your own server). Set `VITE_API_URL` to your deployed
+backend's URL before building, e.g.:
+
+```bash
+VITE_API_URL=https://your-api.onrender.com/api npm run build
+```
+
+Keep the admin dashboard on a URL your customers don't stumble onto (a
+subdomain like `admin.yoursite.com`, or just don't link to it) — it's for
+your team, not the public.
+
+---
+
+## 4. Connect it to your website
+
+This is the part that answers "how do I hook this up." The backend exposes a
+**public, read-only** set of endpoints under `/api/public/*` — no login
+required, safe to call directly from your website's frontend or backend.
+They only ever return products marked "visible" in the dashboard, and never
+expose cost or internal stock-movement history — just enough to show
+customers what's in stock.
+
+| Endpoint                          | Returns                                      |
+|------------------------------------|-----------------------------------------------|
+| `GET /api/public/products`         | All published products                        |
+| `GET /api/public/products?search=` | Filtered by name/description                   |
+| `GET /api/public/products?categoryId=` | Filtered by category                      |
+| `GET /api/public/products/:id`     | One product                                    |
+| `GET /api/public/categories`       | Categories that have at least one published product |
+
+Each product looks like this:
+
+```json
+{
+  "id": 3,
+  "sku": "MUG-001",
+  "name": "Coffee Mug",
+  "description": "12oz ceramic mug.",
+  "price": 12.5,
+  "imageUrl": null,
+  "category": { "id": 1, "name": "Apparel" },
+  "inStock": true,
+  "stockStatus": "in_stock"
+}
+```
+
+`stockStatus` is `"in_stock"`, `"low_stock"`, or `"out_of_stock"` — exact
+counts are never exposed publicly, only status.
+
+### Example: calling it from your website (any React/Node/PHP site)
+
+```js
+// Anywhere in your website's frontend or backend code:
+const res = await fetch("https://your-api.onrender.com/api/public/products");
+const products = await res.json();
+```
+
+```php
+// PHP example
+$response = file_get_contents("https://your-api.onrender.com/api/public/products");
+$products = json_decode($response, true);
+```
+
+### CORS
+
+If your website's frontend calls the API directly from the browser, add its
+domain to `CORS_ORIGINS` in the backend's `.env`:
+
+```
+CORS_ORIGINS=https://mystore.com,https://www.mystore.com
+```
+
+If your website has its own backend, you can instead call the public API
+server-to-server from there — CORS doesn't apply, and it's one less thing to
+configure.
+
+### Keeping stock accurate
+
+When an order comes in on your website, have your website's backend record
+the sale so stock stays correct everywhere:
+
+```js
+await fetch("https://your-api.onrender.com/api/stock/movements", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${SERVICE_TOKEN}`, // see below
+  },
+  body: JSON.stringify({ productId: 3, type: "SALE", quantity: 1, note: "Order #1042" }),
+});
+```
+
+This endpoint requires a login token, unlike the public endpoints — it
+changes data, so it shouldn't be open to anyone. The simplest approach: add a
+dedicated user for your website (`POST /api/auth/users` as an admin), log in
+once from your website's backend, and cache that token server-side.
+
+---
+
+## Notes on the data model
+
+- **Products** have a SKU, price, cost (optional, for margin tracking),
+  quantity, a reorder threshold, a category, and an `isPublished` flag that
+  controls whether they show up in the public API.
+- **Stock movements** are an append-only log (`RESTOCK`, `SALE`,
+  `ADJUSTMENT`, `RETURN`) — every quantity change is recorded with who did it
+  and when, so you always have an audit trail.
+- **Users** are `ADMIN` or `STAFF`. Admins can add teammates; both roles can
+  manage products and stock.
+
+To reset everything, stop the server and delete `backend/db/inventory.db`
+(and the `-shm`/`-wal` files next to it), then run `npm run seed` again.
